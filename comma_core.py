@@ -59,7 +59,7 @@ except ImportError:  # module de traduction absent : textes français
     def _(text: str) -> str:
         return text
 
-VERSION = "2.1"
+VERSION = "1.0"
 
 COMMA_API = "https://comma.inria.fr/api"
 COMMA_SITE = "https://comma.inria.fr"
