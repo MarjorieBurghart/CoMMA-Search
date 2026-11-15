@@ -8,8 +8,9 @@ on:
   push:
     tags: ["v*"]
 
+# Moindre privilège : lecture seule partout, écriture seulement pour publier la version.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -26,11 +27,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Outils de construction
-        run: python -m pip install pyinstaller certifi
+      - name: Outils de construction (versions figées)
+        run: python -m pip install -r packaging/requirements-build.txt
       - name: Tests hors ligne
         run: python -m unittest discover -s tests -v
       - name: Construction
@@ -69,15 +72,19 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: out
           merge-multiple: true
+      - name: Empreintes SHA-256
+        run: cd out && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       - name: Release GitHub
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
             --title "CoMMA-Search $GITHUB_REF_NAME" \
-            --notes "Exécutables Windows, macOS (Apple Silicon) et Linux. Voir README.md (français) / README.en.md (English)."
+            --notes "Exécutables Windows, macOS (Apple Silicon) et Linux. Empreintes dans SHA256SUMS.txt. Voir README.md (français) / README.en.md (English)."

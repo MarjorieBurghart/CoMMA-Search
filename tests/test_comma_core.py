@@ -175,9 +175,6 @@ class TestAlto(unittest.TestCase):
             self.assertEqual(names, ["manifest.txt", "f0.xml"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestTranslations(unittest.TestCase):
     """Chaque texte passé à _() a une traduction anglaise avec les mêmes paramètres."""
@@ -272,3 +269,132 @@ class TestRobustness(unittest.TestCase):
 
     def test_open_path_never_raises(self):
         self.assertIsInstance(cc.open_path(os.path.join("/", "chemin", "inexistant", "x")) or "", str)
+
+
+class TestSecurity(unittest.TestCase):
+    """Données réseau hostiles : rien ne doit s'exécuter ni s'écrire hors du dossier prévu."""
+
+    def test_only_web_urls_are_opened(self):
+        for good in ("https://api.irht.cnrs.fr/ark:/63955/x/manifest.json", "http://example.org/a"):
+            self.assertTrue(cc.is_web_url(good), good)
+        for bad in ("C:\\Windows\\System32\\cmd.exe", "\\\\attacker\\share\\x.exe", "file:///etc/passwd",
+                    "javascript:alert(1)", "search-ms:query=x", "https://", "", None, 42, "https://a\nb"):
+            self.assertFalse(cc.is_web_url(bad), repr(bad))
+
+    def test_hostile_iiif_values_are_dropped(self):
+        m = cc.Manuscript.from_json({"uri": cc.BIBLISSIMA_ENTITY + "Q1", "title": "T", "iiif": "C:\\x.exe"})
+        self.assertIsNone(m.iiif)
+        m = cc._resource_to_manuscript({"@id": "u", "title": 7, "dublinCore": {"source": "\\\\srv\\x.hta"}}, [])
+        self.assertIsNone(m.iiif)
+        self.assertEqual(m.title, "7")
+
+    def test_archive_paths(self):
+        for good in ("batch_018/france-troyes-fonds-principal-0816-integral.tar.gz",
+                     "batch_030/BSB Clm 13501.tar.gz", "batch_030/BSB Autogr.Cim. Melanchthon, Philipp.8.tar.gz",
+                     "old-batch-subfolders-1/bn-f-departement-des-manuscrits-latin-/bn-f-x-latin-5014.tar.gz"):
+            self.assertTrue(cc.is_safe_archive_path(good), good)
+        for bad in ("b/..\\..\\Startup\\x.tar.gz", "b/../x.tar.gz", "/etc/x.tar.gz", "b/.tar.gz", "C:/x.tar.gz",
+                    "b/x.tar", "b//x.tar.gz", "b/CON.tar.gz", "b/x /y.tar.gz", "b/x./y.tar.gz", None, ["x"]):
+            self.assertFalse(cc.is_safe_archive_path(bad), repr(bad))
+
+    def test_bundled_index_is_fully_valid(self):
+        data = cc._read_json_gz(os.path.join(cc.BUNDLED_DATA_DIR, cc.ALTO_INDEX_FILE))
+        self.assertEqual(len(cc.AltoIndex(data)), len(data["archives"]))
+
+    def test_bad_index_entries_are_skipped(self):
+        idx = cc.AltoIndex()
+        idx.load({"archives": [{"path": "b/../../evil.tar.gz"}, {"path": "b/ok.tar.gz", "size": "3"}]})
+        self.assertEqual([a.path for a in idx.all()], ["b/ok.tar.gz"])
+        self.assertIsNone(idx.all()[0].size)
+        idx.merge_listing([{"path": "b/ok.tar.gz"}, {"path": "C:\\x.tar.gz"}, {"nopath": 1}])
+        self.assertEqual(len(idx), 1)
+
+    def test_local_names_are_unique_and_safe(self):
+        idx = cc.AltoIndex()
+        idx.load({"archives": [{"path": "batch_000/bn-f-latin-10600.tar.gz"},
+                               {"path": "old-batch-subfolders-0/bn-f-latin-10600.tar.gz"},
+                               {"path": "batch_001/unique.tar.gz"}]})
+        names = [idx.local_name(a) for a in idx.all()]
+        self.assertEqual(len(set(names)), 3)
+        self.assertIn("unique", names)
+        self.assertIn("bn-f-latin-10600__batch_000", names)
+        self.assertEqual(cc.safe_local_name('a<b>:c/d\\e'), "a_b__c_d_e")
+        self.assertEqual(cc.safe_local_name("CON"), "archive_CON")
+
+    def _tar(self, members):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for info, data in members:
+                tar.addfile(info, io.BytesIO(data) if data is not None else None)
+        return tarfile.open(fileobj=io.BytesIO(buf.getvalue()), mode="r:gz")
+
+    def test_extraction_allowlist(self):
+        import tempfile
+
+        def f(name, data=b"x"):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            return info, data
+        link = tarfile.TarInfo("evil-link")
+        link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
+        hard = tarfile.TarInfo("evil-hard")
+        hard.type, hard.linkname = tarfile.LNKTYPE, "f0.xml"
+        dev = tarfile.TarInfo("evil-dev")
+        dev.type = tarfile.CHRTYPE
+        with tempfile.TemporaryDirectory() as tmp:
+            tar = self._tar([f("manifest.txt"), f("f0.xml"), (link, None), (hard, None), (dev, None),
+                             f("../up.xml"), f("/abs.xml"), f("C:/drive.xml"), f("a\\b.xml"), f("NUL.xml")])
+            names = [m.name for m in cc._safe_members(tar, os.path.join(tmp, "out"), 100)]
+        self.assertEqual(names, ["manifest.txt", "f0.xml"])
+
+    def test_extraction_size_limits(self):
+        import tempfile
+        info = tarfile.TarInfo("big.xml")
+        info.size = 100
+        with tempfile.TemporaryDirectory() as tmp:
+            old = cc.MAX_MEMBER_BYTES
+            cc.MAX_MEMBER_BYTES = 10
+            try:
+                tar = self._tar([(info, b"y" * 100)])
+                with self.assertRaises(cc.ArchiveError):
+                    list(cc._safe_members(tar, tmp, 100))
+            finally:
+                cc.MAX_MEMBER_BYTES = old
+
+    def test_manifest_lines_never_leave_the_folder(self):
+        self.assertEqual(cc._safe_rel("dir/f0.xml"), ["dir", "f0.xml"])
+        for bad in ("\\\\attacker\\share\\f.xml", "C:/x.xml", "/etc/passwd", "../x.xml", "a//b", ""):
+            self.assertIsNone(cc._safe_rel(bad), repr(bad))
+
+    def test_pagination_stays_on_the_api(self):
+        good = '<%s/batch_000?recursive=true&cursor=abc>; rel="next"' % cc.HF_TREE
+        self.assertTrue(cc._next_link({"Link": good}).startswith(cc.HF_TREE + "/"))
+        for bad in ('<file:///etc/passwd>; rel="next"', '<https://evil.example/x>; rel="next"',
+                    '<%s/x>; rel="prev"' % cc.HF_TREE, "<" * 70000):
+            self.assertIsNone(cc._next_link({"Link": bad}), bad[:40])
+
+    def test_https_only(self):
+        import urllib.error
+        import urllib.request
+        handler = cc._HttpsOnlyRedirect()
+        req = urllib.request.Request("https://huggingface.co/x")
+        for target in ("http://cdn.example/x", "ftp://cdn.example/x", "file:///etc/passwd"):
+            with self.assertRaises(urllib.error.HTTPError):
+                handler.redirect_request(req, None, 302, "Found", {}, target)
+        self.assertIsNotNone(handler.redirect_request(req, None, 302, "Found", {}, "https://cdn.example/x"))
+        with self.assertRaises(cc.HttpError):
+            cc.http_get("http://example.org/")
+        with self.assertRaises(cc.HttpError):
+            cc.http_get("file:///etc/passwd")
+
+    def test_download_refuses_unsafe_archive(self):
+        import tempfile
+        a = cc.AltoArchive(path="b/../../evil.tar.gz")
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(cc.ArchiveError):
+                cc.download_and_extract(a, tmp)
+            self.assertEqual(os.listdir(tmp), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

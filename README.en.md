@@ -12,7 +12,7 @@ Both indexes are built once and shipped with the tool; at each search, it only r
 
 ### Executables (no Python needed)
 
-Ready-to-use executables are attached to each release (**Releases** tab): `CoMMA-Search-windows.zip`, `CoMMA-Search-macos.zip` (Apple Silicon Macs), `CoMMA-Search-linux.tar.gz`. Unpack and run `CoMMA-Search`.
+Ready-to-use executables are attached to each release (**Releases** tab): `CoMMA-Search-windows.zip`, `CoMMA-Search-macos.zip` (Apple Silicon Macs), `CoMMA-Search-linux.tar.gz`. Unpack and run `CoMMA-Search`. Each release also publishes `SHA256SUMS.txt`, to check the downloaded files.
 
 They are not signed:
 
@@ -52,8 +52,8 @@ Repository files:
 | `comma_i18n.py` | French / English translations |
 | `donnees/catalogue_comma.json.gz` (0.9 MB) | shipped CoMMA catalogue |
 | `donnees/index_alto.json.gz` (0.8 MB) | shipped ALTO archive index |
-| `tests/test_comma_core.py` | 25 offline tests: `python -m unittest discover -s tests` |
-| `packaging/comma_search.spec` | building the executables (PyInstaller) |
+| `tests/test_comma_core.py` | 37 offline tests, 12 of them on security: `python -m unittest discover -s tests` |
+| `packaging/comma_search.spec`, `packaging/requirements-build.txt` | building the executables (PyInstaller, pinned versions) |
 | `.github/workflows/` | `Tests` (Windows, macOS, Linux) and `Binaries` (executables) |
 
 Only the Python standard library is used (urllib, gzip, zlib, tarfile, tkinter): nothing to install, on Windows, macOS and Linux.
@@ -206,7 +206,7 @@ Verified example: `api.irht.cnrs.fr/ark:/63955/fdy27ubqm4j0/manifest.json` → Q
 **Download and extraction.**
 
 1. The archive is downloaded from `huggingface.co/datasets/comma-project/alto-dataset/resolve/main/<path>` into a `.part` file specific to that download, with three attempts and a size check.
-2. It is extracted to `<destination>/<archive name>/`, without symbolic links or paths that would leave the folder.
+2. It is extracted to `<destination>/<archive name>/`, followed by `__<batch>` when several archives share the same name (3,925 archives as of 15 Nov 2026: otherwise two different digitizations would mix). Only ordinary files and folders are extracted, with size limits, without links or paths that would leave the folder.
 3. The tool checks that every file listed in `manifest.txt` is present (Châteaudun A2: 18 of 18).
 4. It writes `provenance_comma.json`: shelfmark, title, Biblissima URI, IIIF manifest, transcription link, archive, match status and certainty, date, result of the check.
 
@@ -216,11 +216,21 @@ The `.tar.gz` archive is kept next to the folder. The default destination is `~/
 
 ## Robustness, cache, languages and limits
 
-**Cache and settings.** The updated catalogue and index, the settings (`reglages.json`: language, destination folder) and the error log are kept in `%LOCALAPPDATA%\CommaRecherche` (Windows), `~/Library/Caches/CommaRecherche` (macOS) or `~/.cache/comma-recherche` (Linux). Writes are atomic: a unique temporary file, then a replace, retried if an antivirus holds the file.
+**Cache and settings.** The updated catalogue and index, the settings (`reglages.json`: language, destination folder) and the error log are kept in `%LOCALAPPDATA%\CommaRecherche` (Windows), `~/Library/Caches/CommaRecherche` (macOS) or `~/.cache/comma-recherche` (Linux). Writes (indexes, settings) are atomic: a unique temporary file, then a replace, retried if an antivirus holds the file; several windows open at once therefore do not damage each other's files.
 
 **Background work.** Every network operation runs in a worker thread that never touches the window: it communicates through a message queue read every 120 ms. On closing, tasks stop between two requests (under a second in practice) and cleanup happens on the main thread, which avoids Tkinter crashes in Spyder. A newer search discards stale results; a short delay after each click avoids a burst of checks.
 
 **Network.** Retries on transient errors (429, 5xx, dropped connections, truncated responses), honouring `Retry-After`; no retry on an invalid certificate or an unknown host name. Partial reads are capped, even if a proxy ignores the `Range` header.
+
+**Security.** Everything coming from the network (CoMMA API, Hugging Face listing, archive contents, Biblissima) is treated as untrusted:
+
+- only `http(s)` addresses are opened in the browser, never a local or network path (on Windows, Python would hand it to `os.startfile`, which could launch a program);
+- archive names and `manifest.txt` lines are validated: they cannot cause writes or reads outside the destination folder;
+- extraction accepts only ordinary files and folders (no links, no sparse files), with size and count limits;
+- every connection is https, including after a redirect, and response sizes are capped;
+- 12 tests replay these attack scenarios.
+
+**Privacy.** The tool sends no personal data. All that leaves: the input, to the CoMMA server, when the local catalogue finds nothing; a manuscript's IIIF manifest, to Biblissima (deep search, archive name input); a re-read of the Hugging Face list every 7 days at startup. `provenance_comma.json` only holds a relative path.
 
 **Error log.** Every error is appended to `journal_erreurs.txt` (menu **Index… → Open the error log**), including a hard crash, thanks to the `faulthandler` module. If the application crashes, this is the file to send.
 
@@ -242,10 +252,10 @@ The `.tar.gz` archive is kept next to the folder. The default destination is `~/
 
 ## Building the executables
 
-They are built by the **Binaries** workflow (`.github/workflows/binaries.yml`), on demand (*Actions* tab) or on every `v*` tag, which then attaches them to a release. To build one yourself:
+They are built by the **Binaries** workflow (`.github/workflows/binaries.yml`), on demand (*Actions* tab) or on every `v*` tag, which then attaches them to a release with their SHA-256 checksums. The build steps only have read access to the repository; only the publishing step can write. To build one yourself:
 
 ```bash
-pip install pyinstaller certifi
+pip install -r packaging/requirements-build.txt
 ```
 
 ```bash

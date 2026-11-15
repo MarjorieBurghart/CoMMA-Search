@@ -91,7 +91,7 @@ EXAMPLES = ["Troyes, BM, 816", "Troyes 0816", "Paris, BnF, Latin 16400", "BnF La
 
 
 def human_size(n):
-    if not n:
+    if not isinstance(n, (int, float)) or isinstance(n, bool) or n <= 0:
         return ""
     units = ("o", "Ko", "Mo", "Go") if i18n.get_language() == "fr" else ("B", "KB", "MB", "GB")
     for unit in units:
@@ -159,7 +159,8 @@ def run_cli(query, live=True, download_dir=None):
         for n in res.notes:
             print(_("  NB : ") + n)
         if download_dir and res.confirmed:
-            rep = cc.download_and_extract(res.confirmed[0].archive, download_dir, progress=print,
+            arch = res.confirmed[0].archive
+            rep = cc.download_and_extract(arch, download_dir, progress=print, local_name=index.local_name(arch),
                                           provenance={"cote": m.normalized_reference,
                                                       "biblissima": m.uri, "iiif": m.iiif})
             print(_("  Extraction : %(presents)d / %(annonces)d fichiers dans %(dossier)s") % rep)
@@ -324,8 +325,26 @@ def run_gui(initial_query=""):
             self.status_var.set(_("Copié : %s") % text[:120])
 
         def open_url(self, url):
-            if url:
-                webbrowser.open(url)
+            """N'ouvre que des adresses http(s) : sous Windows, webbrowser.open passe la
+            valeur à os.startfile, qui exécuterait un chemin local ou réseau."""
+            if not url:
+                return
+            if not cc.is_web_url(url):
+                self._mb("showwarning", _("Ouverture impossible"),
+                         _("Ce n'est pas une adresse web : elle n'est pas ouverte.\n\n%s") % url[:300])
+                return
+            url = url.strip()
+            if getattr(sys, "frozen", False) and sys.platform.startswith("linux"):
+                # exécutable Linux : le navigateur ne doit pas hériter du chemin des
+                # bibliothèques embarquées (cc.child_environment) ; l'application, elle,
+                # en a besoin, donc on ne touche pas à son propre environnement
+                import subprocess
+                try:
+                    subprocess.Popen(["xdg-open", url], env=cc.child_environment())
+                    return
+                except OSError:
+                    pass
+            webbrowser.open(url)
 
         # -------------------------------------------------------- interface
         def _build(self):
@@ -647,21 +666,27 @@ def run_gui(initial_query=""):
             """Rien en local : on interroge le serveur CoMMA (ressource directe ou recherche)."""
             gen = self.search_gen
 
+            stop = self.stop
+
             def job():
                 out = []
                 if q.qid:
-                    m = cc.comma_resource(cc.BIBLISSIMA_ENTITY + q.qid)
+                    m = cc.comma_resource(cc.BIBLISSIMA_ENTITY + q.qid, stop=stop)
                     if m:
                         out.append((m, 1.0))
                     return out
                 import re
                 import urllib.parse
-                d = cc.http_json("%s/manuscripts/?%s" % (cc.COMMA_API, urllib.parse.urlencode({"q": raw, "size": 50})))
-                for it in d.get("items", []):
-                    title = re.sub(r"<[^>]+>", "", it.get("title") or "")
+                d = cc.http_json("%s/manuscripts/?%s" % (cc.COMMA_API, urllib.parse.urlencode({"q": raw[:500], "size": 50})),
+                                 stop=stop)
+                items = d.get("items") if isinstance(d, dict) else None
+                for it in items if isinstance(items, list) else []:
+                    if not isinstance(it, dict) or not isinstance(it.get("collection"), str) or not it["collection"]:
+                        continue
+                    title = re.sub(r"<[^<>]{0,200}>", "", cc._text(it.get("title"))[:2000])
                     mu = it.get("manifest_url")
                     mu = mu[0] if isinstance(mu, list) and mu else mu
-                    m = cc.Manuscript(uri=it.get("collection", ""), title=title, iiif=mu,
+                    m = cc.Manuscript(uri=it["collection"], title=title, iiif=cc.web_url_or_none(mu),
                                       created=cc._first(it.get("created")), language=cc._first(it.get("language")))
                     m.prepare()
                     if q.numbers and not all(n in m.keys for n in q.numbers):
@@ -691,11 +716,12 @@ def run_gui(initial_query=""):
                 self.results_label.configure(text=_("Archive inconnue de l'index : %s") % name)
                 return
             gen = self.search_gen
+            catalog, index, stop = self.catalog, self.index, self.stop
 
             def job():
                 found, notes = [], []
                 for a in archives:
-                    mss, n = cc.archive_to_manuscripts(a, self.catalog, self.index)
+                    mss, n = cc.archive_to_manuscripts(a, catalog, index, stop=stop)
                     notes += ["%s : %s" % (a.name, x) for x in n]
                     found += [m for m in mss if m not in found]
                 return found, notes
@@ -744,8 +770,8 @@ def run_gui(initial_query=""):
             def job():  # ne capture pas la fenêtre : seulement des données, la file et l'arrêt
                 if stop.is_set():
                     return None
-                res = cc.resolve_alto(m, catalog, index, live=True, progress=log)
-                cc.check_comma_page(res)
+                res = cc.resolve_alto(m, catalog, index, live=True, progress=log, stop=stop)
+                cc.check_comma_page(res, stop=stop)
                 return res
 
             def done(res, err):
@@ -896,7 +922,7 @@ def run_gui(initial_query=""):
             for a in archives:
                 self.downloading.add(a.path)
             m = resolution.manuscript
-            dest = self.download_dir
+            dest, index = self.download_dir, self.index
             prov = {"cote": m.normalized_reference, "intitule_comma": m.title, "biblissima": m.uri,
                     "manifeste_iiif_comma": m.iiif, "transcription_comma": m.comma_url(resolution.first_page)}
 
@@ -906,7 +932,8 @@ def run_gui(initial_query=""):
                     match = next((mt for mt in resolution.matches if mt.archive is a), None)
                     p = dict(prov, correspondance=cc.status_label(match.status) if match else "?",
                              certitude=match.certainty if match else None)
-                    reports.append(cc.download_and_extract(a, dest, progress=self.log, provenance=p, stop=self.stop))
+                    reports.append(cc.download_and_extract(a, dest, progress=self.log, provenance=p, stop=self.stop,
+                                                           local_name=index.local_name(a)))
                 return reports
 
             def done(reports, err):
@@ -946,10 +973,10 @@ def run_gui(initial_query=""):
                     self.log(_("Relecture de %d archives de « %s »…") % (len(group), m.city))
                     self.index.scan_many(group, progress=self.log, stop=self.stop)
                 self.index.save()
-                res = cc.resolve_alto(m, self.catalog, self.index, live=False)
-                cc.check_comma_page(res)
+                res = cc.resolve_alto(m, self.catalog, self.index, live=False, stop=self.stop)
+                cc.check_comma_page(res, stop=self.stop)
                 try:
-                    q = cc.biblissima_by_iiif(m.iiif) if m.iiif else []
+                    q = cc.biblissima_by_iiif(m.iiif, stop=self.stop) if m.iiif else []
                     res.notes.append(_("Biblissima (P196) pour ce manifeste : %s") % (", ".join(q) or _("aucun item")))
                 except Exception as exc:  # noqa: BLE001
                     res.notes.append(_("Biblissima injoignable : %s") % exc)
@@ -1029,8 +1056,9 @@ def run_gui(initial_query=""):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     init_language(argv)
+    interactive = sys.stdin is not None and sys.stdout is not None  # absent dans l'exécutable fenêtré
     # Spyder/IPython passent parfois leurs propres arguments : on ne garde que les nôtres
-    if "--cli" in argv:
+    if "--cli" in argv and interactive:
         i = argv.index("--cli")
         rest = argv[i + 1:]
         words, skip = [], False
@@ -1055,7 +1083,7 @@ def main(argv=None):
         import tkinter  # noqa: F401
         run_gui(initial)
     except Exception as exc:  # pas d'affichage graphique disponible
-        if "display" in str(exc).lower() or isinstance(exc, ImportError):
+        if ("display" in str(exc).lower() or isinstance(exc, ImportError)) and interactive:
             print(_("Interface graphique indisponible (%s) : mode texte.") % exc)
             while True:
                 q = input(_("\nCote (vide pour quitter) : ")).strip()

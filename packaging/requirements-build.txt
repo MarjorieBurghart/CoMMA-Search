@@ -1,0 +1,4 @@
+# Outils de construction des exécutables (versions figées)
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10
+certifi==2026.10.23

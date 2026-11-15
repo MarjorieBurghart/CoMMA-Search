@@ -291,6 +291,20 @@ EN = {
         "Nothing in the local catalogue, and the CoMMA server could not be queried: %s",
     "Recherche des archives ALTO impossible : %s": "Could not look for ALTO archives: %s",
     "Déjà en cours :\n%s": "Already in progress:\n%s",
+
+    # --- sécurité : données réseau non fiables
+    "Adresse refusée (https seulement) : %s": "Address refused (https only): %s",
+    "Réponse trop volumineuse pour %s": "Response too large for %s",
+    "Parcours du catalogue anormalement long : arrêté": "Catalogue walk abnormally long: stopped",
+    "Archive refusée : %s": "Archive refused: %s",
+    "trop de fichiers": "too many files",
+    "fichier démesuré": "oversized file",
+    "taille extraite démesurée": "oversized extracted content",
+    "chemin dangereux": "unsafe path",
+    "Le dossier %s contient déjà une autre archive (%s)": "The folder %s already contains another archive (%s)",
+    "Téléchargement plus gros qu'annoncé, arrêté : %s": "Download larger than announced, stopped: %s",
+    "Introuvable : %s": "Not found: %s",
+    "Ce n'est pas une adresse web : elle n'est pas ouverte.\n\n%s": "This is not a web address: it is not opened.\n\n%s",
     "Chemins trop longs pour Windows (%d caractères) : choisissez un dossier de destination plus court "
     "(par exemple C:\\ALTO). Détail : %s":
         "Paths too long for Windows (%d characters): choose a shorter destination folder "

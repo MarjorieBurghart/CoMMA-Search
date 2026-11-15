@@ -32,6 +32,7 @@ Règle d'or : une recherche infructueuse n'est jamais une preuve d'absence.
 
 from __future__ import annotations
 
+import getpass
 import gzip
 import http.client
 import json
@@ -77,6 +78,79 @@ USER_AGENT = "CommaRecherche/%s (outil de recherche CoMMA; Python urllib)" % VER
 ProgressFn = Optional[Callable[[str], None]]
 
 # --------------------------------------------------------------------------
+# Limites et validation des données venues du réseau (traitées comme non fiables)
+# --------------------------------------------------------------------------
+
+MAX_JSON_BYTES = 64 << 20          # réponse JSON la plus grosse acceptée
+MAX_DOWNLOAD_BYTES = 8 << 30       # plafond absolu d'un téléchargement de taille inconnue
+MAX_MEMBER_BYTES = 512 << 20       # plus gros fichier accepté dans une archive
+MAX_MEMBERS = 200_000              # nombre de fichiers dans une archive
+MAX_EXPANSION = 60                 # taille extraite <= 60 x taille compressée (+ 64 Mo)
+MAX_LISTING_PAGES = 1000           # pages de liste Hugging Face par dossier
+MAX_LAST_PAGE = 5000               # pages d'une collection DTS
+MAX_CRAWL_PAGES = 50_000           # pages lues pendant tout le parcours du catalogue
+
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | \
+    {"LPT%d" % i for i in range(1, 10)}
+_BAD_PATH_CHARS = set('<>:"|?*\\')
+
+
+def is_web_url(value) -> bool:
+    """Vrai seulement pour une adresse http(s) avec un nom d'hôte.
+
+    Indispensable avant webbrowser.open : sous Windows, il appelle os.startfile,
+    qui exécuterait un chemin local ou réseau (« \\\\serveur\\x.exe »).
+    """
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        return False
+    if any(c in value for c in "\r\n\t\0"):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(value.strip())
+    except ValueError:
+        return False
+    return parts.scheme.lower() in ("http", "https") and bool(parts.netloc)
+
+
+def web_url_or_none(value) -> Optional[str]:
+    return value.strip() if is_web_url(value) else None
+
+
+def is_safe_archive_path(path) -> bool:
+    """Chemin d'archive acceptable venu de la liste Hugging Face : relatif, sans « .. »,
+    sans lettre de lecteur ni barre oblique inverse, sans caractère interdit sous Windows.
+    (Les espaces et les virgules sont permis : 37 archives de Munich en contiennent.)"""
+    if not isinstance(path, str) or not path.endswith(".tar.gz") or len(path) > 400:
+        return False
+    if path.startswith("/"):
+        return False
+    parts = path.split("/")
+    for part in parts:
+        if part in ("", ".", ".."):
+            return False
+        if any(ord(c) < 32 or c in _BAD_PATH_CHARS for c in part):
+            return False
+        if part != part.strip() or part.endswith("."):
+            return False
+    stem = parts[-1][:-7]
+    return bool(stem) and not stem.startswith(".") and stem.split(".")[0].upper() not in _WIN_RESERVED
+
+
+def safe_local_name(text: str) -> str:
+    """Nom de dossier ou de fichier local sûr sur les trois systèmes."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text or "").strip(" .")
+    if not name or name.split(".")[0].upper() in _WIN_RESERVED:
+        name = "archive_" + name
+    return name[:180]
+
+
+def _text(value) -> str:
+    """Champ texte d'une réponse réseau : toujours une chaîne."""
+    if isinstance(value, str):
+        return value
+    return "" if value is None else str(value)
+
+# --------------------------------------------------------------------------
 # Emplacements des fichiers
 # --------------------------------------------------------------------------
 
@@ -99,9 +173,17 @@ def user_cache_dir() -> str:
         path = os.path.join(base, "comma-recherche")
     try:
         os.makedirs(path, exist_ok=True)
-    except OSError:  # profil non inscriptible : dossier temporaire
-        path = os.path.join(tempfile.gettempdir(), "comma-recherche")
-        os.makedirs(path, exist_ok=True)
+    except OSError:  # profil non inscriptible : dossier temporaire propre à l'utilisateur
+        try:
+            user = re.sub(r"[^A-Za-z0-9_-]", "_", getpass.getuser() or "user")
+        except Exception:
+            user = "user"
+        path = os.path.join(tempfile.gettempdir(), "comma-recherche-" + user)
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        if hasattr(os, "getuid"):  # dossier partagé /tmp : il doit être à nous, et à nous seuls
+            st = os.lstat(path)
+            if os.path.islink(path) or st.st_uid != os.getuid() or (st.st_mode & 0o077):
+                path = tempfile.mkdtemp(prefix="comma-recherche-")
     return path
 
 
@@ -128,9 +210,14 @@ def load_settings() -> dict:
 
 
 def save_settings(data: dict) -> None:
+    """Écriture atomique (fichier temporaire puis remplacement) ; jamais d'exception."""
     try:
-        with open(settings_path(), "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=1)
+        path = settings_path()
+        with _SAVE_LOCK:
+            tmp = "%s.%d.%d.tmp" % (path, os.getpid(), threading.get_ident())
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=1)
+            _replace_with_retry(tmp, path)
     except Exception:
         pass
 
@@ -198,7 +285,14 @@ def _load_newest(filename: str):
 # --------------------------------------------------------------------------
 
 def _ssl_context() -> ssl.SSLContext:
-    try:  # certifi évite les erreurs de certificats du Python de python.org sous macOS
+    """Certificats du système (Windows, Linux) ; certifi sous macOS, où le Python de
+    python.org n'en a pas, ou si le système n'en fournit aucun."""
+    if sys.platform != "darwin":
+        paths = ssl.get_default_verify_paths()
+        if sys.platform.startswith("win") or (paths.cafile and os.path.exists(paths.cafile)) or \
+                (paths.capath and os.path.isdir(paths.capath)):
+            return ssl.create_default_context()
+    try:
         import certifi  # type: ignore
         return ssl.create_default_context(cafile=certifi.where())
     except Exception:
@@ -206,6 +300,28 @@ def _ssl_context() -> ssl.SSLContext:
 
 
 _SSL = _ssl_context()
+
+
+class _HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse toute redirection qui ne mène pas à une adresse https."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme.lower() != "https":
+            raise urllib.error.HTTPError(newurl, code, "redirect to a non-https URL refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _build_opener() -> urllib.request.OpenerDirector:
+    """Ouvreur réduit : https seulement (pas de file://, ftp://, data:, ni http en clair)."""
+    opener = urllib.request.OpenerDirector()
+    for handler in (urllib.request.ProxyHandler(), urllib.request.UnknownHandler(),
+                    urllib.request.HTTPDefaultErrorHandler(), _HttpsOnlyRedirect(),
+                    urllib.request.HTTPErrorProcessor(), urllib.request.HTTPSHandler(context=_SSL)):
+        opener.add_handler(handler)
+    return opener
+
+
+_OPENER = _build_opener()
 
 
 class HttpError(Exception):
@@ -231,7 +347,10 @@ def http_get(url: str, headers: Optional[dict] = None, timeout: float = 60,
 
     max_bytes borne la lecture : si un serveur ignore l'en-tête Range et renvoie
     toute une archive de plusieurs centaines de Mo, on n'en lit que le début.
+    Sans max_bytes, une réponse de plus de MAX_JSON_BYTES est refusée.
     """
+    if not url.startswith("https://"):
+        raise HttpError(_("Adresse refusée (https seulement) : %s") % url[:200])
     hdrs = {"User-Agent": USER_AGENT}
     if headers:
         hdrs.update(headers)
@@ -242,8 +361,13 @@ def http_get(url: str, headers: Optional[dict] = None, timeout: float = 60,
         wait_s = min(30, 1.5 * 2 ** attempt)
         try:
             req = urllib.request.Request(url, headers=hdrs)
-            with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as resp:
-                body = resp.read(max_bytes) if max_bytes else resp.read()
+            with _OPENER.open(req, timeout=timeout) as resp:
+                if max_bytes:
+                    body = resp.read(max_bytes)
+                else:
+                    body = resp.read(MAX_JSON_BYTES + 1)
+                    if len(body) > MAX_JSON_BYTES:
+                        raise HttpError(_("Réponse trop volumineuse pour %s") % url)
                 if want_headers:
                     return body, resp.status, dict(resp.headers)
                 return body
@@ -523,30 +647,33 @@ class Manuscript:
 
     @classmethod
     def from_json(cls, d: dict) -> "Manuscript":
-        m = cls(uri=d["uri"], title=d.get("title") or "", iiif=d.get("iiif"),
-                created=d.get("created", ""), language=d.get("language", ""),
-                extent=d.get("extent", ""), city=d.get("city", ""),
-                institution=d.get("institution", ""))
+        uri = d.get("uri") if isinstance(d, dict) else None
+        if not isinstance(uri, str) or not uri:
+            raise ValueError("fiche sans identifiant")
+        m = cls(uri=uri, title=_text(d.get("title")), iiif=web_url_or_none(d.get("iiif")),
+                created=_text(d.get("created")), language=_text(d.get("language")),
+                extent=_text(d.get("extent")), city=_text(d.get("city")),
+                institution=_text(d.get("institution")))
         m.prepare()
         return m
 
 
-def _first(v):
+def _first(v) -> str:
     if isinstance(v, list):
         v = [x for x in v if x]
         return ", ".join(str(x) for x in v)
-    return v or ""
+    return _text(v)
 
 
 def _resource_to_manuscript(member: dict, parents: Sequence[str]) -> Manuscript:
-    dc = member.get("dublinCore") or {}
+    dc = member.get("dublinCore") if isinstance(member.get("dublinCore"), dict) else {}
     src = dc.get("source")
     if isinstance(src, list):
-        src = next((s for s in src if s), None)
-    city = parents[0] if parents else ""
-    institution = parents[-1] if len(parents) >= 2 else ""
-    m = Manuscript(uri=member.get("@id", ""), title=member.get("title") or "",
-                   iiif=src, created=_first(dc.get("created")),
+        src = next((s for s in src if isinstance(s, str) and s), None)
+    city = _text(parents[0]) if parents else ""
+    institution = _text(parents[-1]) if len(parents) >= 2 else ""
+    m = Manuscript(uri=_text(member.get("@id")), title=_text(member.get("title")),
+                   iiif=web_url_or_none(src), created=_first(dc.get("created")),
                    language=_first(dc.get("language")),
                    extent=_first(dc.get("extent")), city=city,
                    institution=institution)
@@ -560,38 +687,39 @@ def comma_collection_page(cid: str, page: int = 1, stop: Optional[threading.Even
     return http_json(url, stop=stop)
 
 
-def comma_resource(uri: str) -> Optional[Manuscript]:
+def comma_resource(uri: str, stop: Optional[threading.Event] = None) -> Optional[Manuscript]:
     """Interroge directement le serveur DTS pour une ressource (Q...)."""
     url = "%s/collection/?id=%s" % (COMMA_API, urllib.parse.quote(uri, safe=""))
     try:
-        d = http_json(url, retries=2)
+        d = http_json(url, retries=2, stop=stop)
     except HttpError as exc:
         if exc.code == 404:
             return None
         raise
-    if d.get("@type") != "Resource":
+    if not isinstance(d, dict) or d.get("@type") != "Resource":
         return None
-    m = _resource_to_manuscript(d, [])
-    return m
+    return _resource_to_manuscript(d, [])
 
 
-def comma_pages(uri: str) -> List[str]:
+def comma_pages(uri: str, stop: Optional[threading.Event] = None) -> List[str]:
     """Identifiants ordonnés des pages d'une ressource (API DTS /navigation)."""
     url = "%s/navigation/?resource=%s&down=1" % (COMMA_API, urllib.parse.quote(uri, safe=""))
-    d = http_json(url, retries=2)
-    return [m.get("identifier") for m in (d.get("member") or []) if m.get("identifier")]
+    d = http_json(url, retries=2, stop=stop)
+    members = d.get("member") if isinstance(d, dict) else None
+    return [m["identifier"] for m in (members or [])
+            if isinstance(m, dict) and isinstance(m.get("identifier"), str) and m["identifier"]]
 
 
-def comma_first_page(uri: str) -> Optional[str]:
-    pages = comma_pages(uri)
+def comma_first_page(uri: str, stop: Optional[threading.Event] = None) -> Optional[str]:
+    pages = comma_pages(uri, stop=stop)
     return pages[0] if pages else None
 
 
 def _last_page(view: Optional[dict]) -> int:
-    if not view:
+    if not isinstance(view, dict):
         return 1
-    m = re.search(r"[?&]page=(\d+)", view.get("last") or "")
-    return int(m.group(1)) if m else 1
+    m = re.search(r"[?&]page=(\d{1,9})", _text(view.get("last"))[:2048])
+    return max(1, min(int(m.group(1)), MAX_LAST_PAGE)) if m else 1
 
 
 def crawl_comma_catalog(progress: ProgressFn = None, workers: int = 6,
@@ -606,11 +734,13 @@ def crawl_comma_catalog(progress: ProgressFn = None, workers: int = 6,
     def handle_members(members, parents):
         subs = []
         for mem in members:
+            if not isinstance(mem, dict):
+                continue
             if mem.get("@type") == "Resource":
                 ms = _resource_to_manuscript(mem, parents)
                 with lock:
                     results[ms.uri] = ms
-            elif mem.get("@type") == "Collection" and mem.get("@id"):
+            elif mem.get("@type") == "Collection" and isinstance(mem.get("@id"), str) and mem["@id"]:
                 with lock:
                     if mem["@id"] in visited:
                         continue
@@ -624,7 +754,12 @@ def crawl_comma_catalog(progress: ProgressFn = None, workers: int = 6,
         d = comma_collection_page(cid, page, stop=abort)
         with lock:
             counters["pages"] += 1
-        subs = handle_members(d.get("member") or [], parents)
+            if counters["pages"] > MAX_CRAWL_PAGES:  # serveur qui inventerait des pages sans fin
+                raise HttpError(_("Parcours du catalogue anormalement long : arrêté"))
+        if not isinstance(d, dict):
+            return [], []
+        members = d.get("member") if isinstance(d.get("member"), list) else []
+        subs = handle_members(members, parents)
         extra = []
         if page == 1:
             last = _last_page(d.get("view"))
@@ -818,33 +953,70 @@ class AltoArchive:
 
     @classmethod
     def from_json(cls, d: dict) -> "AltoArchive":
-        a = cls(path=d["path"], size=d.get("size"), iiif=d.get("iiif"),
-                first_xml=d.get("first_xml"), scanned=d.get("scanned", ""),
-                error=d.get("error"))
+        path = d.get("path") if isinstance(d, dict) else None
+        if not is_safe_archive_path(path):
+            raise ValueError("chemin d'archive refusé")
+        size = d.get("size")
+        a = cls(path=path, size=size if isinstance(size, int) and size >= 0 else None,
+                iiif=d.get("iiif") if isinstance(d.get("iiif"), str) else None,
+                first_xml=d.get("first_xml") if isinstance(d.get("first_xml"), str) else None,
+                scanned=_text(d.get("scanned")), error=d.get("error") if isinstance(d.get("error"), str) else None)
         a.prepare()
         return a
 
 
+def _next_link(headers: dict) -> Optional[str]:
+    """Page suivante d'une liste Hugging Face, seulement si elle reste sur la même API."""
+    link = _text(headers.get("Link") or headers.get("link"))[:8192]
+    for part in link.split(","):
+        if 'rel="next"' in part:
+            m = re.search(r"<([^<>]{1,2048})>", part)
+            if m and m.group(1).startswith(HF_TREE + "/"):
+                return m.group(1)
+    return None
+
+
+def _listing_entry(it) -> Optional[dict]:
+    if not isinstance(it, dict) or it.get("type") != "file" or not is_safe_archive_path(it.get("path")):
+        return None
+    size = it.get("size")
+    return {"path": it["path"], "size": size if isinstance(size, int) and size >= 0 else None}
+
+
 def list_hf_archives(progress: ProgressFn = None, stop: Optional[threading.Event] = None) -> List[dict]:
-    """Liste toutes les archives .tar.gz (≈ 30 requêtes, quelques secondes)."""
+    """Liste toutes les archives .tar.gz (≈ 30 requêtes, quelques secondes).
+
+    Les entrées dont le chemin n'est pas sûr sont ignorées ; la pagination ne suit
+    que des liens vers la même API, sans boucle, et avec un nombre de pages borné.
+    """
     top = http_json(HF_TREE, stop=stop)
     out = []
-    for d in top:
-        if d.get("type") == "file" and d["path"].endswith(".tar.gz"):
-            out.append({"path": d["path"], "size": d.get("size")})
-        if d.get("type") != "directory":
+    for d in top if isinstance(top, list) else []:
+        entry = _listing_entry(d)
+        if entry:
+            out.append(entry)
+        if not isinstance(d, dict) or d.get("type") != "directory":
             continue
-        url = "%s/%s?recursive=true&expand=false" % (HF_TREE, urllib.parse.quote(d["path"]))
-        while url:
+        folder = d.get("path")
+        if not isinstance(folder, str) or not folder or "/" in folder or folder in (".", "..") or \
+                any(ord(c) < 32 or c in _BAD_PATH_CHARS for c in folder):
+            continue
+        url = "%s/%s?recursive=true&expand=false" % (HF_TREE, urllib.parse.quote(folder))
+        seen = set()
+        while url and url not in seen and len(seen) < MAX_LISTING_PAGES:
+            seen.add(url)
             body, _status, headers = http_get(url, want_headers=True, stop=stop)
-            for it in json.loads(body.decode("utf-8")):
-                if it.get("type") == "file" and it["path"].endswith(".tar.gz"):
-                    out.append({"path": it["path"], "size": it.get("size")})
-            link = headers.get("Link") or headers.get("link") or ""
-            m = re.search(r'<([^>]+)>;\s*rel="next"', link)
-            url = m.group(1) if m else None
+            try:
+                items = json.loads(body.decode("utf-8"))
+            except ValueError:
+                raise HttpError(_("Réponse illisible (JSON attendu) pour %s") % url)
+            for it in items if isinstance(items, list) else []:
+                entry = _listing_entry(it)
+                if entry:
+                    out.append(entry)
+            url = _next_link(headers)
         if progress:
-            progress(_("Hugging Face : %s… (%d archives)") % (d["path"], len(out)))
+            progress(_("Hugging Face : %s… (%d archives)") % (folder, len(out)))
     return out
 
 
@@ -881,12 +1053,14 @@ def read_archive_manifest_head(path: str, nbytes: int = 4096,
     return first or None, second, member
 
 
-def read_archive_manifest_full(path: str, start: int = 65536, limit: int = 1 << 22) -> List[str]:
+def read_archive_manifest_full(path: str, start: int = 65536, limit: int = 1 << 22,
+                               stop: Optional[threading.Event] = None) -> List[str]:
     """Lit tout manifest.txt (requêtes partielles de taille croissante)."""
     url = HF_RESOLVE + urllib.parse.quote(path)
     nbytes = start
     while True:
-        data = http_get(url, headers={"Range": "bytes=0-%d" % (nbytes - 1)}, retries=4, max_bytes=nbytes)
+        data = http_get(url, headers={"Range": "bytes=0-%d" % (nbytes - 1)}, retries=4, max_bytes=nbytes,
+                        stop=stop)
         raw, member, size = _tar_head(data, path)
         if not member.endswith("manifest.txt"):
             return []
@@ -931,11 +1105,21 @@ class AltoIndex:
 
     def _rebuild(self) -> None:
         by = {}
+        names: Dict[str, int] = {}
         for a in self.all():
             k = a.key_iiif
             if k:
                 by.setdefault(k, []).append(a)
+            names[a.name] = names.get(a.name, 0) + 1
         self.by_iiif = by
+        self.name_counts = names
+
+    def local_name(self, a: "AltoArchive") -> str:
+        """Nom du dossier d'extraction : le nom de l'archive, suivi du lot quand
+        plusieurs archives portent le même nom (3 925 archives au 15/11/2026)."""
+        if getattr(self, "name_counts", {}).get(a.name, 1) > 1:
+            return safe_local_name("%s__%s" % (a.stem, a.path.split("/")[0]))
+        return safe_local_name(a.stem)
 
     @classmethod
     def load_default(cls) -> "AltoIndex":
@@ -966,12 +1150,13 @@ class AltoIndex:
 
     def merge_listing(self, listing: List[dict]) -> Tuple[int, int]:
         """Intègre une nouvelle liste Hugging Face. Renvoie (ajouts, disparitions)."""
-        new_paths = {d["path"] for d in listing}
         added = 0
         with self.lock:
             # copie modifiée puis remplacement d'un bloc : les autres fils qui
             # parcourent l'ancien dictionnaire ne sont pas perturbés
             archives = dict(self.archives)
+            listing = [d for d in listing if isinstance(d, dict) and is_safe_archive_path(d.get("path"))]
+            new_paths = {d["path"] for d in listing}
             for d in listing:
                 a = archives.get(d["path"])
                 if a is None:
@@ -1067,8 +1252,10 @@ class AltoIndex:
 # Biblissima
 # --------------------------------------------------------------------------
 
-def biblissima_by_iiif(manifest_url: str) -> List[str]:
+def biblissima_by_iiif(manifest_url: str, stop: Optional[threading.Event] = None) -> List[str]:
     """Recherche inverse : manifeste IIIF -> Q... (propriété P196)."""
+    if not is_web_url(manifest_url):
+        return []
     urls = [manifest_url]
     m = re.search(r"ark:/12148/([A-Za-z0-9]+)", manifest_url or "")
     if m:  # Biblissima enregistre l'URL Gallica, l'archive l'URL openapi v3
@@ -1078,9 +1265,11 @@ def biblissima_by_iiif(manifest_url: str) -> List[str]:
         params = urllib.parse.urlencode({
             "action": "query", "list": "search", "srnamespace": "120",
             "srsearch": "haswbstatement:P196=%s" % u, "format": "json", "srlimit": "10"})
-        d = http_json(BIBLISSIMA_API + "?" + params, retries=2)
-        for s in d.get("query", {}).get("search", []):
-            q = qid_of(s.get("title"))
+        d = http_json(BIBLISSIMA_API + "?" + params, retries=2, stop=stop)
+        query = d.get("query") if isinstance(d, dict) else None
+        hits = query.get("search") if isinstance(query, dict) else None
+        for s in hits if isinstance(hits, list) else []:
+            q = qid_of(_text(s.get("title")) if isinstance(s, dict) else "")
             if q and q not in found:
                 found.append(q)
         if found:
@@ -1176,7 +1365,8 @@ class Resolution:
 
 
 def resolve_alto(ms: Manuscript, catalog: Catalog, index: AltoIndex,
-                 live: bool = True, progress: ProgressFn = None) -> Resolution:
+                 live: bool = True, progress: ProgressFn = None,
+                 stop: Optional[threading.Event] = None) -> Resolution:
     """Cherche les archives ALTO d'un manuscrit et qualifie chaque lien."""
     res = Resolution(manuscript=ms, matches=[])
     key = ms.key_iiif
@@ -1188,7 +1378,7 @@ def resolve_alto(ms: Manuscript, catalog: Catalog, index: AltoIndex,
         if live:
             if progress:
                 progress(_("Vérification en direct de %s…") % a.name)
-            index.scan(a)
+            index.scan(a, stop=stop)
             if a.key_iiif == key:
                 status, cert, detail = CONFIRMED_LIVE, 100, status_help(CONFIRMED_LIVE)
             elif a.error:
@@ -1207,7 +1397,7 @@ def resolve_alto(ms: Manuscript, catalog: Catalog, index: AltoIndex,
     if to_scan and live:
         if progress:
             progress(_("Lecture de %d manifest.txt candidats…") % len(to_scan))
-        index.scan_many(to_scan, workers=4)
+        index.scan_many(to_scan, workers=4, stop=stop)
     for a, score in cands:
         if a.key_iiif and key and a.key_iiif == key:
             st = CONFIRMED_LIVE if a in to_scan else CONFIRMED
@@ -1241,10 +1431,11 @@ def resolve_alto(ms: Manuscript, catalog: Catalog, index: AltoIndex,
     return res
 
 
-def check_comma_page(res: Resolution, compare_pages: bool = True) -> None:
+def check_comma_page(res: Resolution, compare_pages: bool = True,
+                     stop: Optional[threading.Event] = None) -> None:
     """Vérifie la ressource auprès du serveur DTS et récupère la 1re page."""
     try:
-        res.pages = comma_pages(res.manuscript.uri)
+        res.pages = comma_pages(res.manuscript.uri, stop=stop)
         res.first_page = res.pages[0] if res.pages else None
         res.comma_checked = True
         res.comma_note = (_("Ressource et première page confirmées par l'API DTS de CoMMA (%d pages) ; "
@@ -1255,13 +1446,13 @@ def check_comma_page(res: Resolution, compare_pages: bool = True) -> None:
         return
     if compare_pages:
         for m in res.confirmed:
-            compare_page_lists(m, res.pages)
+            compare_page_lists(m, res.pages, stop=stop)
 
 
-def compare_page_lists(match: "AltoMatch", pages: List[str]) -> None:
+def compare_page_lists(match: "AltoMatch", pages: List[str], stop: Optional[threading.Event] = None) -> None:
     """Second contrôle : pages CoMMA et fichiers listés par manifest.txt (nombre et ordre)."""
     try:
-        lines = read_archive_manifest_full(match.archive.path)
+        lines = read_archive_manifest_full(match.archive.path, stop=stop)
     except Exception as exc:  # noqa: BLE001
         match.detail += _("\nComparaison des pages impossible : %s") % exc
         return
@@ -1280,11 +1471,12 @@ def compare_page_lists(match: "AltoMatch", pages: List[str]) -> None:
 
 
 def archive_to_manuscripts(a: AltoArchive, catalog: Catalog, index: AltoIndex,
-                           use_biblissima: bool = True) -> Tuple[List[Manuscript], List[str]]:
+                           use_biblissima: bool = True,
+                           stop: Optional[threading.Event] = None) -> Tuple[List[Manuscript], List[str]]:
     """Chaîne inverse : archive -> manifest.txt -> IIIF -> CoMMA (et Biblissima)."""
     notes = []
     if not a.iiif:
-        index.scan(a)
+        index.scan(a, stop=stop)
     if not a.iiif:
         return [], [_("manifest.txt illisible : %s") % (a.error or "?")]
     notes.append("manifest.txt : %s" % a.iiif)
@@ -1293,13 +1485,13 @@ def archive_to_manuscripts(a: AltoArchive, catalog: Catalog, index: AltoIndex,
         notes.append(_("Manifeste trouvé dans le catalogue CoMMA."))
     if use_biblissima:
         try:
-            qids = biblissima_by_iiif(a.iiif)
+            qids = biblissima_by_iiif(a.iiif, stop=stop)
             if qids:
                 notes.append(_("Biblissima (P196) : %s") % ", ".join(qids))
                 for q in qids:
                     m = catalog.by_qid.get(q)
                     if m is None:
-                        m = comma_resource(BIBLISSIMA_ENTITY + q)
+                        m = comma_resource(BIBLISSIMA_ENTITY + q, stop=stop)
                     if m is not None and m not in found:
                         found.append(m)
                         if m.key_iiif != a.key_iiif:
@@ -1316,15 +1508,57 @@ def archive_to_manuscripts(a: AltoArchive, catalog: Catalog, index: AltoIndex,
 # Téléchargement et extraction
 # --------------------------------------------------------------------------
 
-def _safe_members(tar: tarfile.TarFile, dest: str):
+class ArchiveError(Exception):
+    """Archive refusée (contenu dangereux ou démesuré)."""
+
+
+def _inside(target: str, root_real: str) -> bool:
+    target = os.path.realpath(target)
+    return target == root_real or target.startswith(root_real + os.sep)
+
+
+def _safe_members(tar: tarfile.TarFile, dest: str, compressed_size: int = 0):
+    """Membres extractibles sans risque : fichiers et dossiers ordinaires seulement
+    (ni liens, ni périphériques, ni fichiers « creux »), noms relatifs restant dans
+    dest, tailles bornées (fichier, total, nombre de membres)."""
     dest_real = os.path.realpath(dest)
-    for m in tar.getmembers():
-        if m.issym() or m.islnk() or m.isdev():
+    budget = MAX_EXPANSION * max(compressed_size, 0) + (64 << 20)
+    total = count = 0
+    for m in tar:
+        count += 1
+        if count > MAX_MEMBERS:
+            raise ArchiveError(_("Archive refusée : %s") % _("trop de fichiers"))
+        if not (m.isfile() or m.isdir()) or m.issparse():
             continue
-        target = os.path.realpath(os.path.join(dest, m.name))
-        if not (target == dest_real or target.startswith(dest_real + os.sep)):
+        name = m.name
+        if not name or name.startswith(("/", "\\")) or "\\" in name or ":" in name:
             continue
+        base = name.rstrip("/").rsplit("/", 1)[-1]
+        if base.split(".")[0].upper() in _WIN_RESERVED or any(ord(c) < 32 for c in name):
+            continue
+        if not _inside(os.path.join(dest, name), dest_real):
+            continue
+        if m.isfile():
+            if m.size > MAX_MEMBER_BYTES:
+                raise ArchiveError(_("Archive refusée : %s") % _("fichier démesuré"))
+            total += m.size
+            if total > budget:
+                raise ArchiveError(_("Archive refusée : %s") % _("taille extraite démesurée"))
+            m.mode = 0o644
+        else:
+            m.mode = 0o755
         yield m
+
+
+def _safe_rel(rel: str) -> Optional[List[str]]:
+    """Ligne de manifest.txt utilisable comme chemin relatif, ou None (jamais de
+    chemin absolu, UNC, lettre de lecteur ou « .. » : ils ne sont même pas testés)."""
+    if not rel or len(rel) > 512 or "\\" in rel or ":" in rel or rel.startswith("/"):
+        return None
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") or any(ord(c) < 32 for c in p) for p in parts):
+        return None
+    return parts
 
 
 def _replace_with_retry(src: str, dst: str) -> None:
@@ -1350,13 +1584,19 @@ def _remove_quietly(path: str) -> None:
 def _download_once(a: "AltoArchive", part: str, progress: ProgressFn, stop: Optional[threading.Event]) -> None:
     req = urllib.request.Request(a.download_url, headers={"User-Agent": USER_AGENT})
     try:
-        resp_cm = urllib.request.urlopen(req, timeout=120, context=_SSL)
+        resp_cm = _OPENER.open(req, timeout=120)
     except urllib.error.HTTPError as exc:
         raise HttpError(_("HTTP %s pour %s") % (exc.code, a.download_url), exc.code)
     except urllib.error.URLError as exc:
         raise HttpError(_("Erreur réseau pour %s : %s") % (a.download_url, exc))
     with resp_cm as resp, open(part, "wb") as out:
-        total = int(resp.headers.get("Content-Length") or a.size or 0)
+        try:
+            announced = int(resp.headers.get("Content-Length") or 0)
+        except ValueError:
+            announced = 0
+        sizes = [n for n in (announced, a.size or 0) if n > 0]
+        total = announced or (a.size or 0)
+        ceiling = (max(sizes) + (1 << 20)) if sizes else MAX_DOWNLOAD_BYTES
         got = 0
         last = 0.0
         while True:
@@ -1367,6 +1607,8 @@ def _download_once(a: "AltoArchive", part: str, progress: ProgressFn, stop: Opti
                 break
             out.write(chunk)
             got += len(chunk)
+            if got > ceiling:  # plus gros qu'annoncé : on n'écrit pas indéfiniment
+                raise HttpError(_("Téléchargement plus gros qu'annoncé, arrêté : %s") % a.name, 413)
             if progress and time.time() - last > 0.3:
                 last = time.time()
                 pct = " (%d %%)" % (100 * got // total) if total else ""
@@ -1377,13 +1619,36 @@ def _download_once(a: "AltoArchive", part: str, progress: ProgressFn, stop: Opti
 
 def download_and_extract(a: AltoArchive, dest_root: str, progress: ProgressFn = None,
                          provenance: Optional[dict] = None,
-                         stop: Optional[threading.Event] = None) -> dict:
-    """Télécharge l'archive, l'extrait dans dest_root/<nom>/, contrôle manifest.txt."""
+                         stop: Optional[threading.Event] = None,
+                         local_name: Optional[str] = None) -> dict:
+    """Télécharge l'archive, l'extrait dans dest_root/<nom local>/, contrôle manifest.txt.
+
+    local_name : nom du dossier (AltoIndex.local_name : le nom de l'archive, suivi du
+    lot quand plusieurs archives portent le même nom). Le dossier et l'archive restent
+    toujours directement dans dest_root, quel que soit le nom venu du réseau.
+    """
+    if not is_safe_archive_path(a.path):
+        raise ArchiveError(_("Archive refusée : %s") % _("chemin dangereux"))
+    name = safe_local_name(local_name or a.stem)
     os.makedirs(dest_root, exist_ok=True)
-    folder = os.path.join(dest_root, a.stem)
+    root_real = os.path.realpath(dest_root)
+    folder = os.path.join(dest_root, name)
+    tgz = os.path.join(dest_root, name + ".tar.gz")
+    for target in (folder, tgz):
+        if os.path.dirname(os.path.realpath(target)) != root_real:
+            raise ArchiveError(_("Archive refusée : %s") % _("chemin dangereux"))
+    previous = os.path.join(folder, "provenance_comma.json")
+    if os.path.exists(previous):  # le dossier contient-il déjà une AUTRE archive ?
+        try:
+            with open(previous, encoding="utf-8") as fh:
+                other = json.load(fh).get("archive_hugging_face")
+        except Exception:
+            other = None
+        if other and other != a.path:
+            raise ArchiveError(_("Le dossier %s contient déjà une autre archive (%s)") % (folder, other))
     os.makedirs(folder, exist_ok=True)
-    tgz = os.path.join(dest_root, a.name)
-    part = "%s.%d.part" % (tgz, threading.get_ident())  # deux téléchargements simultanés ne se mélangent pas
+    # deux téléchargements simultanés (fils ou instances) ne se mélangent pas
+    part = "%s.%d.%d.part" % (tgz, os.getpid(), threading.get_ident())
 
     last_exc = None
     for attempt in range(3):
@@ -1407,7 +1672,7 @@ def download_and_extract(a: AltoArchive, dest_root: str, progress: ProgressFn = 
     if progress:
         progress(_("Extraction de %s…") % a.name)
     with tarfile.open(tgz, "r:gz") as tar:
-        members = list(_safe_members(tar, folder))
+        members = list(_safe_members(tar, folder, os.path.getsize(tgz)))
         try:
             try:
                 tar.extractall(folder, members=members, filter="data")  # Python ≥ 3.12 (et correctifs)
@@ -1420,29 +1685,53 @@ def download_and_extract(a: AltoArchive, dest_root: str, progress: ProgressFn = 
                                 "de destination plus court (par exemple C:\\ALTO). Détail : %s") % (longest, exc))
             raise
 
-    # contrôle : fichiers annoncés par manifest.txt
+    # contrôle : fichiers annoncés par manifest.txt (lignes non sûres jamais testées)
     report = {"archive": a.path, "dossier": folder, "manifeste_iiif": None,
               "annonces": 0, "presents": 0, "manquants": []}
     mpath = os.path.join(folder, "manifest.txt")
-    if os.path.exists(mpath):
+    if os.path.isfile(mpath):
         with open(mpath, encoding="utf-8", errors="replace") as fh:
-            lines = [l.strip() for l in fh if l.strip()]
+            lines = [line.strip() for _i, line in zip(range(MAX_MEMBERS + 1), fh) if line.strip()]
         if lines:
-            report["manifeste_iiif"] = lines[0]
+            report["manifeste_iiif"] = lines[0][:2048]
             listed = lines[1:]
             report["annonces"] = len(listed)
+            folder_real = os.path.realpath(folder)
             for rel in listed:
-                base = rel.split("/", 1)[-1]
-                if os.path.exists(os.path.join(folder, rel)) or os.path.exists(os.path.join(folder, base)):
+                parts = _safe_rel(rel)
+                found = False
+                if parts:
+                    for cand in (os.path.join(folder, *parts), os.path.join(folder, *parts[1:]) if len(parts) > 1 else None):
+                        if cand and _inside(cand, folder_real) and os.path.isfile(cand):
+                            found = True
+                            break
+                if found:
                     report["presents"] += 1
-                else:
-                    report["manquants"].append(rel)
+                elif len(report["manquants"]) < 1000:
+                    report["manquants"].append(rel[:512])
     info = dict(provenance or {})
+    # chemin relatif seulement : le chemin absolu contient le nom d'utilisateur
     info.update({"archive_hugging_face": a.path, "url": a.download_url,
-                 "telecharge_le": time.strftime("%Y-%m-%d %H:%M:%S"), "controle": report})
+                 "telecharge_le": time.strftime("%Y-%m-%d %H:%M:%S"),
+                 "controle": dict(report, dossier=name)})
     with open(os.path.join(folder, "provenance_comma.json"), "w", encoding="utf-8") as fh:
         json.dump(info, fh, ensure_ascii=False, indent=2)
     return report
+
+
+def child_environment() -> dict:
+    """Environnement des programmes lancés (navigateur, gestionnaire de fichiers).
+
+    Dans l'exécutable Linux construit par PyInstaller, LD_LIBRARY_PATH pointe vers les
+    bibliothèques embarquées, ce qui peut faire planter les programmes lancés."""
+    env = dict(os.environ)
+    if getattr(sys, "frozen", False) and sys.platform.startswith("linux"):
+        orig = env.pop("LD_LIBRARY_PATH_ORIG", None)
+        if orig is not None:
+            env["LD_LIBRARY_PATH"] = orig
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env
 
 
 def open_path(path: str) -> Optional[str]:
@@ -1452,12 +1741,15 @@ def open_path(path: str) -> Optional[str]:
     """
     import subprocess
     try:
+        if not isinstance(path, str) or not os.path.exists(path):
+            return _("Introuvable : %s") % path
+        path = os.path.abspath(path)  # jamais interprété comme une option ou une URL
         if sys.platform.startswith("win"):
             os.startfile(path)  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
+            subprocess.Popen(["open", "--", path])
         else:
-            subprocess.Popen(["xdg-open", path])
+            subprocess.Popen(["xdg-open", path], env=child_environment())
         return None
     except Exception as exc:  # noqa: BLE001 — xdg-open absent, dossier supprimé…
         return str(exc)

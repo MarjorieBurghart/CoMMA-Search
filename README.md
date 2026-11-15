@@ -12,7 +12,7 @@ Les deux index sont construits une fois et livrés avec l'outil ; à chaque rech
 
 ### Exécutables (sans Python)
 
-Des exécutables prêts à l'emploi sont joints aux versions publiées (onglet **Releases**) : `CoMMA-Search-windows.zip`, `CoMMA-Search-macos.zip` (Mac Apple Silicon), `CoMMA-Search-linux.tar.gz`. Décompressez et lancez `CoMMA-Search`.
+Des exécutables prêts à l'emploi sont joints aux versions publiées (onglet **Releases**) : `CoMMA-Search-windows.zip`, `CoMMA-Search-macos.zip` (Mac Apple Silicon), `CoMMA-Search-linux.tar.gz`. Décompressez et lancez `CoMMA-Search`. Chaque version publie aussi `SHA256SUMS.txt`, pour vérifier les fichiers téléchargés.
 
 Ils ne sont pas signés :
 
@@ -52,8 +52,8 @@ Les fichiers du dépôt :
 | `comma_i18n.py` | traductions français / anglais |
 | `donnees/catalogue_comma.json.gz` (0,9 Mo) | catalogue CoMMA livré |
 | `donnees/index_alto.json.gz` (0,8 Mo) | index des archives ALTO livré |
-| `tests/test_comma_core.py` | 25 tests hors ligne : `python -m unittest discover -s tests` |
-| `packaging/comma_search.spec` | construction des exécutables (PyInstaller) |
+| `tests/test_comma_core.py` | 37 tests hors ligne, dont 12 de sécurité : `python -m unittest discover -s tests` |
+| `packaging/comma_search.spec`, `packaging/requirements-build.txt` | construction des exécutables (PyInstaller, versions figées) |
 | `.github/workflows/` | `Tests` (Windows, macOS, Linux) et `Binaries` (exécutables) |
 
 Seule la bibliothèque standard de Python est utilisée (urllib, gzip, zlib, tarfile, tkinter) : rien à installer, sous Windows, macOS et Linux.
@@ -206,7 +206,7 @@ Exemple vérifié : `api.irht.cnrs.fr/ark:/63955/fdy27ubqm4j0/manifest.json` →
 **Téléchargement et extraction.**
 
 1. L'archive est téléchargée depuis `huggingface.co/datasets/comma-project/alto-dataset/resolve/main/<chemin>` dans un fichier `.part` propre à ce téléchargement, avec trois tentatives et un contrôle de la taille.
-2. Elle est extraite dans `<destination>/<nom de l'archive>/`, sans liens symboliques ni chemins qui sortiraient du dossier.
+2. Elle est extraite dans `<destination>/<nom de l'archive>/`, suivi de `__<lot>` quand plusieurs archives portent le même nom (3 925 archives au 15/11/2026 : sans cela, deux numérisations différentes se mélangeraient). Seuls les fichiers et dossiers ordinaires sont extraits, de taille bornée, sans liens ni chemins qui sortiraient du dossier.
 3. L'outil vérifie que chaque fichier annoncé par `manifest.txt` est présent (Châteaudun A2 : 18 sur 18).
 4. Il écrit `provenance_comma.json` : cote, intitulé, URI Biblissima, manifeste IIIF, lien de transcription, archive, statut de la correspondance et certitude, date, bilan du contrôle.
 
@@ -216,11 +216,21 @@ L'archive `.tar.gz` est gardée à côté du dossier. La destination par défaut
 
 ## Robustesse, cache, langues et limites
 
-**Cache et réglages.** Le catalogue et l'index mis à jour, les réglages (`reglages.json` : langue, dossier de destination) et le journal des erreurs sont rangés dans `%LOCALAPPDATA%\CommaRecherche` (Windows), `~/Library/Caches/CommaRecherche` (macOS) ou `~/.cache/comma-recherche` (Linux). Les écritures sont atomiques : fichier temporaire unique, puis remplacement, avec nouvelles tentatives si un antivirus tient le fichier.
+**Cache et réglages.** Le catalogue et l'index mis à jour, les réglages (`reglages.json` : langue, dossier de destination) et le journal des erreurs sont rangés dans `%LOCALAPPDATA%\CommaRecherche` (Windows), `~/Library/Caches/CommaRecherche` (macOS) ou `~/.cache/comma-recherche` (Linux). Les écritures (index, réglages) sont atomiques : fichier temporaire unique, puis remplacement, avec nouvelles tentatives si un antivirus tient le fichier ; plusieurs fenêtres ouvertes à la fois ne s'abîment donc pas mutuellement leurs fichiers.
 
 **Fonctionnement en arrière-plan.** Toute opération réseau tourne dans un fil secondaire qui ne touche jamais à la fenêtre : il communique par une file de messages, lue toutes les 120 ms. À la fermeture, les tâches s'arrêtent entre deux requêtes (moins d'une seconde en pratique) et le nettoyage se fait dans le fil principal, ce qui évite les plantages de Tkinter dans Spyder. Une recherche plus récente annule l'affichage des résultats périmés ; une courte attente après chaque clic évite une rafale de vérifications.
 
 **Réseau.** Nouvelles tentatives sur les erreurs passagères (429, 5xx, coupures, réponses tronquées) en respectant `Retry-After` ; aucune nouvelle tentative sur un certificat invalide ou un nom d'hôte inconnu. Les lectures partielles sont plafonnées, même si un proxy ignore l'en-tête `Range`.
+
+**Sécurité.** Tout ce qui vient du réseau (API CoMMA, liste Hugging Face, contenu des archives, Biblissima) est traité comme non fiable :
+
+- seules les adresses `http(s)` sont ouvertes dans le navigateur, jamais un chemin local ou réseau (sous Windows, Python le confierait à `os.startfile`, qui pourrait lancer un programme) ;
+- les noms d'archives et les lignes de `manifest.txt` sont validés : ils ne peuvent faire ni écrire ni lire hors du dossier de destination ;
+- l'extraction n'accepte que des fichiers et des dossiers ordinaires (ni liens, ni fichiers « creux »), avec des plafonds de taille et de nombre ;
+- toutes les connexions sont en https, y compris après une redirection, et la taille des réponses est plafonnée ;
+- 12 tests rejouent ces scénarios d'attaque.
+
+**Confidentialité.** L'outil n'envoie aucune donnée personnelle. Sortent seulement : la saisie, vers le serveur CoMMA, quand le catalogue local ne trouve rien ; le manifeste IIIF d'un manuscrit, vers Biblissima (recherche approfondie, saisie d'un nom d'archive) ; une relecture de la liste Hugging Face tous les 7 jours au démarrage. `provenance_comma.json` ne contient qu'un chemin relatif.
 
 **Journal des erreurs.** Toute erreur est ajoutée à `journal_erreurs.txt` (menu **Index… → Ouvrir le journal des erreurs**), y compris un plantage brutal grâce au module `faulthandler`. En cas de plantage, c'est ce fichier qu'il faut envoyer.
 
@@ -242,10 +252,10 @@ L'archive `.tar.gz` est gardée à côté du dossier. La destination par défaut
 
 ## Construire les exécutables
 
-Ils sont construits par le workflow **Binaries** (`.github/workflows/binaries.yml`), à la demande (onglet *Actions*) ou à chaque étiquette `v*`, qui les joint alors à une version publiée. Pour en construire un soi-même :
+Ils sont construits par le workflow **Binaries** (`.github/workflows/binaries.yml`), à la demande (onglet *Actions*) ou à chaque étiquette `v*`, qui les joint alors à une version publiée avec leurs empreintes SHA-256. Les étapes de construction n'ont qu'un accès en lecture au dépôt ; seule la publication peut écrire. Pour en construire un soi-même :
 
 ```bash
-pip install pyinstaller certifi
+pip install -r packaging/requirements-build.txt
 ```
 
 ```bash
