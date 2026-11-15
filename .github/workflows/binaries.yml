@@ -1,0 +1,80 @@
+name: Binaries
+
+# Construit les exécutables Windows, macOS et Linux.
+# - à la main : onglet Actions > Binaries > Run workflow (exécutables en « artifacts ») ;
+# - en poussant une étiquette vX.Y : exécutables joints à une « release » GitHub.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: CoMMA-Search-windows
+          - os: macos-latest
+            name: CoMMA-Search-macos
+          - os: ubuntu-22.04
+            name: CoMMA-Search-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Outils de construction
+        run: python -m pip install pyinstaller certifi
+      - name: Tests hors ligne
+        run: python -m unittest discover -s tests -v
+      - name: Construction
+        run: pyinstaller --noconfirm --clean packaging/comma_search.spec
+      - name: Paquet Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path pkg | Out-Null
+          Copy-Item dist/CoMMA-Search.exe, README.md, LISEZMOI.md pkg/
+          Compress-Archive -Path pkg/* -DestinationPath "${{ matrix.name }}.zip"
+      - name: Paquet macOS
+        if: runner.os == 'macOS'
+        run: |
+          mkdir pkg
+          cp -R dist/CoMMA-Search.app README.md LISEZMOI.md pkg/
+          ditto -c -k --sequesterRsrc pkg "${{ matrix.name }}.zip"
+      - name: Paquet Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir pkg
+          cp dist/CoMMA-Search README.md LISEZMOI.md pkg/
+          tar czf "${{ matrix.name }}.tar.gz" -C pkg .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.name }}.zip
+            ${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Release GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
+            --title "CoMMA-Search $GITHUB_REF_NAME" \
+            --notes "Exécutables Windows, macOS (Apple Silicon) et Linux. Voir LISEZMOI.md / README.md."
