@@ -252,6 +252,7 @@ pip install pyinstaller certifi
 pyinstaller --noconfirm --clean packaging/comma_search.spec
 ```
 
-## Data
+## Licences
 
-The indexes in `donnees/` are derived from CoMMA's public metadata (Inria) and from the `comma-project/alto-dataset` repository, published under the CC BY 4.0 licence.
+- **Code**: [MIT](LICENSE) licence.
+- **Data**: the indexes in `donnees/` are derived from CoMMA's public metadata (Inria) and from the `comma-project/alto-dataset` repository, published under the [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) licence, which they keep. Source: Clérice et al., [CoMMA, a Large-scale Corpus of Multilingual Medieval Archives](https://inria.hal.science/hal-05299220).

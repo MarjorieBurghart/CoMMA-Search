@@ -40,21 +40,21 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path pkg/docs -Force | Out-Null
-          Copy-Item dist/CoMMA-Search.exe, README.md, README.en.md pkg/
+          Copy-Item dist/CoMMA-Search.exe, README.md, README.en.md, LICENSE pkg/
           Copy-Item docs/schema.png pkg/docs/
           Compress-Archive -Path pkg/* -DestinationPath "${{ matrix.name }}.zip"
       - name: Paquet macOS
         if: runner.os == 'macOS'
         run: |
           mkdir -p pkg/docs
-          cp -R dist/CoMMA-Search.app README.md README.en.md pkg/
+          cp -R dist/CoMMA-Search.app README.md README.en.md LICENSE pkg/
           cp docs/schema.png pkg/docs/
           ditto -c -k --sequesterRsrc pkg "${{ matrix.name }}.zip"
       - name: Paquet Linux
         if: runner.os == 'Linux'
         run: |
           mkdir -p pkg/docs
-          cp dist/CoMMA-Search README.md README.en.md pkg/
+          cp dist/CoMMA-Search README.md README.en.md LICENSE pkg/
           cp docs/schema.png pkg/docs/
           tar czf "${{ matrix.name }}.tar.gz" -C pkg .
       - uses: actions/upload-artifact@v4

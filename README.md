@@ -252,6 +252,7 @@ pip install pyinstaller certifi
 pyinstaller --noconfirm --clean packaging/comma_search.spec
 ```
 
-## Données
+## Licences
 
-Les index de `donnees/` sont dérivés des métadonnées publiques de CoMMA (Inria) et du dépôt `comma-project/alto-dataset`, publiés sous licence CC BY 4.0.
+- **Code** : licence [MIT](LICENSE).
+- **Données** : les index de `donnees/` sont dérivés des métadonnées publiques de CoMMA (Inria) et du dépôt `comma-project/alto-dataset`, publiés sous licence [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/), qu'ils conservent. Source : Clérice et al., [CoMMA, a Large-scale Corpus of Multilingual Medieval Archives](https://inria.hal.science/hal-05299220).
