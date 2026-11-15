@@ -39,20 +39,23 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path pkg | Out-Null
-          Copy-Item dist/CoMMA-Search.exe, README.md, LISEZMOI.md pkg/
+          New-Item -ItemType Directory -Path pkg/docs -Force | Out-Null
+          Copy-Item dist/CoMMA-Search.exe, README.md, README.en.md pkg/
+          Copy-Item docs/schema.png pkg/docs/
           Compress-Archive -Path pkg/* -DestinationPath "${{ matrix.name }}.zip"
       - name: Paquet macOS
         if: runner.os == 'macOS'
         run: |
-          mkdir pkg
-          cp -R dist/CoMMA-Search.app README.md LISEZMOI.md pkg/
+          mkdir -p pkg/docs
+          cp -R dist/CoMMA-Search.app README.md README.en.md pkg/
+          cp docs/schema.png pkg/docs/
           ditto -c -k --sequesterRsrc pkg "${{ matrix.name }}.zip"
       - name: Paquet Linux
         if: runner.os == 'Linux'
         run: |
-          mkdir pkg
-          cp dist/CoMMA-Search README.md LISEZMOI.md pkg/
+          mkdir -p pkg/docs
+          cp dist/CoMMA-Search README.md README.en.md pkg/
+          cp docs/schema.png pkg/docs/
           tar czf "${{ matrix.name }}.tar.gz" -C pkg .
       - uses: actions/upload-artifact@v4
         with:
@@ -77,4 +80,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
             --title "CoMMA-Search $GITHUB_REF_NAME" \
-            --notes "Exécutables Windows, macOS (Apple Silicon) et Linux. Voir LISEZMOI.md / README.md."
+            --notes "Exécutables Windows, macOS (Apple Silicon) et Linux. Voir README.md (français) / README.en.md (English)."
