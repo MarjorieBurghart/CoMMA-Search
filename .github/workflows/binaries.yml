@@ -82,9 +82,15 @@ jobs:
       - name: Empreintes SHA-256
         run: cd out && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
       - name: Release GitHub
+        # Si la version a été créée à la main sur GitHub (avec son texte), on y ajoute
+        # seulement les fichiers ; sinon on la crée.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
-            --title "CoMMA-Search $GITHUB_REF_NAME" \
-            --notes "Exécutables Windows, macOS (Apple Silicon) et Linux. Empreintes dans SHA256SUMS.txt. Voir README.md (français) / README.en.md (English)."
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
+              --title "CoMMA-Search $GITHUB_REF_NAME" \
+              --notes "Exécutables Windows, macOS (Apple Silicon) et Linux. Empreintes dans SHA256SUMS.txt. Voir README.md (français) / README.en.md (English)."
+          fi
