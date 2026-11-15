@@ -25,13 +25,13 @@ Python 3.8 or later, with Tkinter (bundled with Python on Windows and macOS, and
 
 | Use | Command |
 | --- | --- |
-| Spyder | open `COMMA_RECHERCHE_SPYDER.py`, press **F5** |
-| Terminal | `python COMMA_RECHERCHE_SPYDER.py` |
-| Prefilled search | `python COMMA_RECHERCHE_SPYDER.py --recherche "Troyes 816"` |
-| No GUI | `python COMMA_RECHERCHE_SPYDER.py --cli "Troyes, BM, 816"` (add `--telecharger` to download and extract the confirmed archive) |
+| Spyder | open `CoMMAsearch.py`, press **F5** |
+| Terminal | `python CoMMAsearch.py` |
+| Prefilled search | `python CoMMAsearch.py --recherche "Troyes 816"` |
+| No GUI | `python CoMMAsearch.py --cli "Troyes, BM, 816"` (add `--telecharger` to download and extract the confirmed archive) |
 | Language | `--lang fr` or `--lang en` (otherwise the saved setting, then the system language) |
 
-Keep `COMMA_RECHERCHE_SPYDER.py`, `comma_core.py`, `comma_i18n.py` and the `donnees/` folder together.
+Keep `CoMMAsearch.py`, `comma_core.py`, `comma_i18n.py` and the `donnees/` folder together.
 
 ## Overview
 
@@ -47,7 +47,7 @@ Repository files:
 
 | File | Role |
 | --- | --- |
-| `COMMA_RECHERCHE_SPYDER.py` | Tkinter interface (run with F5 in Spyder) and text mode (`--cli`) |
+| `CoMMAsearch.py` | Tkinter interface (run with F5 in Spyder) and text mode (`--cli`) |
 | `comma_core.py` | all the logic: indexes, search, matching, download |
 | `comma_i18n.py` | French / English translations |
 | `donnees/catalogue_comma.json.gz` (0.9 MB) | shipped CoMMA catalogue |

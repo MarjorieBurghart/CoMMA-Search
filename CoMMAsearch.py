@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-COMMA_RECHERCHE_SPYDER.py — moteur de recherche CoMMA et récupération des ALTO.
+CoMMAsearch.py — moteur de recherche CoMMA et récupération des ALTO.
 CoMMA search engine and automatic ALTO retrieval.
 
 Utilisation / Usage
 -------------------
 * Spyder : ouvrir ce fichier et appuyer sur F5 / open this file and press F5.
-* Terminal : python COMMA_RECHERCHE_SPYDER.py
+* Terminal : python CoMMAsearch.py
 * Recherche pré-remplie / prefilled search :
-      python COMMA_RECHERCHE_SPYDER.py --recherche "Troyes 816"
+      python CoMMAsearch.py --recherche "Troyes 816"
 * Sans interface / no GUI :
-      python COMMA_RECHERCHE_SPYDER.py --cli "Troyes, BM, 816"
+      python CoMMAsearch.py --cli "Troyes, BM, 816"
   (--telecharger : télécharger et extraire l'archive confirmée / download and
   extract the confirmed archive)
 * Langue / language : --lang fr | --lang en (sinon : réglage enregistré, puis

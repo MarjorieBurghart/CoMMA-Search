@@ -7,7 +7,7 @@ import sys
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 
 a = Analysis(
-    [os.path.join(ROOT, "COMMA_RECHERCHE_SPYDER.py")],
+    [os.path.join(ROOT, "CoMMAsearch.py")],
     pathex=[ROOT],
     datas=[(os.path.join(ROOT, "donnees"), "donnees")],
     hiddenimports=["certifi"],  # certificats HTTPS (indispensable sous macOS)

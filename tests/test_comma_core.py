@@ -188,7 +188,7 @@ class TestTranslations(unittest.TestCase):
         import comma_i18n
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         missing, bad = [], []
-        for name in ("comma_core.py", "COMMA_RECHERCHE_SPYDER.py"):
+        for name in ("comma_core.py", "CoMMAsearch.py"):
             with open(os.path.join(here, name), encoding="utf-8") as fh:
                 tree = ast.parse(fh.read())
             for node in ast.walk(tree):

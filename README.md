@@ -25,13 +25,13 @@ Python 3.8 ou plus récent, avec Tkinter (fourni avec Python sous Windows et mac
 
 | Usage | Commande |
 | --- | --- |
-| Spyder | ouvrir `COMMA_RECHERCHE_SPYDER.py`, appuyer sur **F5** |
-| Terminal | `python COMMA_RECHERCHE_SPYDER.py` |
-| Recherche pré-remplie | `python COMMA_RECHERCHE_SPYDER.py --recherche "Troyes 816"` |
-| Sans interface | `python COMMA_RECHERCHE_SPYDER.py --cli "Troyes, BM, 816"` (ajouter `--telecharger` pour télécharger et extraire l'archive confirmée) |
+| Spyder | ouvrir `CoMMAsearch.py`, appuyer sur **F5** |
+| Terminal | `python CoMMAsearch.py` |
+| Recherche pré-remplie | `python CoMMAsearch.py --recherche "Troyes 816"` |
+| Sans interface | `python CoMMAsearch.py --cli "Troyes, BM, 816"` (ajouter `--telecharger` pour télécharger et extraire l'archive confirmée) |
 | Langue | `--lang fr` ou `--lang en` (sinon le réglage enregistré, puis la langue du système) |
 
-Gardez ensemble `COMMA_RECHERCHE_SPYDER.py`, `comma_core.py`, `comma_i18n.py` et le dossier `donnees/`.
+Gardez ensemble `CoMMAsearch.py`, `comma_core.py`, `comma_i18n.py` et le dossier `donnees/`.
 
 ## Vue d'ensemble
 
@@ -47,7 +47,7 @@ Les fichiers du dépôt :
 
 | Fichier | Rôle |
 | --- | --- |
-| `COMMA_RECHERCHE_SPYDER.py` | interface Tkinter (lancée par F5 dans Spyder) et mode texte (`--cli`) |
+| `CoMMAsearch.py` | interface Tkinter (lancée par F5 dans Spyder) et mode texte (`--cli`) |
 | `comma_core.py` | toute la logique : index, recherche, correspondances, téléchargement |
 | `comma_i18n.py` | traductions français / anglais |
 | `donnees/catalogue_comma.json.gz` (0,9 Mo) | catalogue CoMMA livré |
